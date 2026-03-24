@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "GAPS Premium",
+  "version": "1.0",
+  "description": "Ajoute des fonctionnalité à Gaps comme le calcul des moyennes de module",
+  "content_scripts": [
+    {
+      "matches": ["*://gaps.heig-vd.ch/*", "*://hes-so.login.eduid.ch/*"],
+      "js": ["autolog.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["*://gaps.heig-vd.ch/consultation/controlescontinus/consultation.php*"],
+      "js": ["content.js"],
+      "css": ["style.css"]
+    },
+    {
+      "matches": ["*://gaps.heig-vd.ch/consultation/*"],
+      "js": ["onglet.js"]
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "gaps-premium@example.com"
+    },
+    "edge": {
+      "browser_action_next_to_addressbar": true
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["uv_data.json"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "permissions": ["storage"]
+}
