@@ -44,14 +44,14 @@ function createLoadingUI() {
   return box;
 }
 
-function updateProgress(current, total) {
+function updateProgress(current, total, label) {
   const text = document.getElementById("uv-loader-text");
   const fill = document.getElementById("uv-loader-fill");
 
   if (!text || !fill) return;
 
   const percent = total > 0 ? Math.round((current / total) * 100) : 100;
-  text.textContent = `Chargement des modules (première fois seulement)… ${percent}%`;
+  text.textContent = `${label || "Scan du programme…"} ${percent}%`;
   fill.style.width = percent + "%";
 }
 
@@ -61,114 +61,238 @@ function removeLoadingUI() {
 }
 
 /*******************************
- * 1) STOCKAGE LOCAL DES MODULES
+ * 1) SCAN DU PROGRAMME (remplace uv_data.json)
+ *
+ * UV_SCAN_CACHE structure :
+ * { [identifier]: { branch, module, coef } }
+ *
+ * - identifier : code UV entre parenthèses dans detail.php, ex. "An1"
+ * - branch     : premier mot du span.sheet-subtitle de la page UV, ex. "An1-TIN"
+ * - module     : nom du program_module_row parent
+ * - coef       : valeur numérique de la 3ème colonne du program_unit_row
  *******************************/
-function loadModules() {
-  const saved = localStorage.getItem("MODULES_CACHE");
-  return saved ? JSON.parse(saved) : null;
+let SCAN_DATA = null;      // { identifier: { branch, module, coef } }
+let BRANCH_TO_MODULE = {}; // branch → module
+let COEFS = {};            // branch → coef
+
+function loadScanData() {
+  const raw = localStorage.getItem("UV_SCAN_CACHE");
+  return raw ? JSON.parse(raw) : null;
 }
 
-function saveModules(modules) {
-  localStorage.setItem("MODULES_CACHE", JSON.stringify(modules));
+function saveScanData(data) {
+  localStorage.setItem("UV_SCAN_CACHE", JSON.stringify(data));
 }
 
-let MODULES = loadModules();
+function buildDerivedFromScan(data) {
+  BRANCH_TO_MODULE = {};
+  COEFS = {};
+  for (const info of Object.values(data)) {
+    if (info.branch) {
+      BRANCH_TO_MODULE[info.branch] = info.module || "Module inconnu";
+      if (!isNaN(info.coef)) COEFS[info.branch] = info.coef;
+    }
+  }
+}
 
-/*******************************
- * 1.5) RECONSTRUIRE MODULES DEPUIS UV_DATA
- *******************************/
-function rebuildModulesFromUVData(uvData) {
-  const modules = {};
+function isScanComplete(data) {
+  if (!data || Object.keys(data).length === 0) return false;
+  return Object.values(data).every(e => e.branch && e.module);
+}
 
-  for (const [id, info] of Object.entries(uvData)) {
-    const moduleName = info?.module || "Inconnu";
-    if (!modules[moduleName]) modules[moduleName] = [];
-    modules[moduleName].push(info.branch);
+async function scanProgramme() {
+  createLoadingUI();
+  updateProgress(0, 0, "Scan du programme (première fois)…");
+
+  const html = await fetch("/consultation/programmes/detail.php").then(r => r.text());
+  const doc = new DOMParser().parseFromString(html, "text/html");
+
+  const allRows = [...doc.querySelectorAll("tr.program_module_row, tr.program_unit_row")];
+  const entries = [];
+  let currentModule = "Module inconnu";
+
+  for (const row of allRows) {
+    if (row.classList.contains("program_module_row")) {
+      const rawModule = row.children[0]?.textContent.trim() || "";
+      // Garde uniquement le texte avant la première parenthèse
+      // ex: "Conception microtechnique 2 (ConceptMT2) 2023 4 ECTS | …" → "Conception microtechnique 2"
+      currentModule = (rawModule.split("(")[0].trim()) || "Module inconnu";
+    } else if (row.classList.contains("program_unit_row")) {
+      const nameCell = row.children[0];
+      const coefCell = row.children[2];
+      if (!nameCell) continue;
+
+      const fullName = nameCell.textContent.trim();
+      const match = fullName.match(/\(([^)]+)\)/);
+      if (!match) continue;
+      const identifier = match[1];
+
+      const coef = coefCell ? parseFloat(coefCell.textContent.trim().replace(",", ".")) : NaN;
+      const link = nameCell.querySelector("a");
+      const href = link?.getAttribute("href") || null;
+
+      entries.push({ identifier, module: currentModule, coef, href });
+    }
   }
 
-  return modules;
-}
+  const total = entries.length;
+  const result = {};
 
-/********************************************
- * NOUVEAU : CHARGER LE JSON DE L'EXTENSION
- ********************************************/
-let UV_DATA = {};
-let BRANCH_TO_ID = {};
+  for (let i = 0; i < entries.length; i++) {
+    const { identifier, module, coef, href } = entries[i];
+    updateProgress(i + 1, total, "Scan du programme (première fois)…");
 
-async function loadUVDataFromExtension() {
-  const url = chrome.runtime.getURL("uv_data.json");
-  const data = await fetch(url).then(r => r.json());
-  return data;
-}
+    let branch = identifier; // fallback si le fetch échoue
 
-async function ensureUVDataLoaded() {
+    if (href) {
+      try {
+        const uvHtml = await fetch(href).then(r => r.text());
+        const uvDoc = new DOMParser().parseFromString(uvHtml, "text/html");
+        const subtitle = uvDoc.querySelector(".sheet-subtitle");
+        if (subtitle) {
+          const firstWord = subtitle.textContent.trim().split(/\s+/)[0];
+          if (firstWord) branch = firstWord;
+        }
+      } catch (_) { /* garde le fallback */ }
+    }
 
-  if (Object.keys(UV_DATA).length > 0) return;
-
-  UV_DATA = await loadUVDataFromExtension();
-
-  for (const [id, info] of Object.entries(UV_DATA)) {
-    BRANCH_TO_ID[info.branch] = id;
+    result[identifier] = { branch, module, coef: isNaN(coef) ? 1 : coef };
   }
 
-  MODULES = rebuildModulesFromUVData(UV_DATA);
-  saveModules(MODULES);
+  removeLoadingUI();
+  return result;
+}
 
-  console.log("UV_DATA chargé :", UV_DATA);
+async function ensureScanLoaded() {
+  if (SCAN_DATA) return;
+
+  const cached = loadScanData();
+  if (isScanComplete(cached)) {
+    SCAN_DATA = cached;
+    buildDerivedFromScan(SCAN_DATA);
+    return;
+  }
+
+  SCAN_DATA = await scanProgramme();
+  saveScanData(SCAN_DATA);
+  buildDerivedFromScan(SCAN_DATA);
 }
 
 /********************************************
  * 4) GETMODULE
  ********************************************/
 function getModule(branchName) {
-
-  const id = BRANCH_TO_ID[branchName];
-  if (!id) return "Module inconnu";
-
-  return UV_DATA[id]?.module || "Module inconnu";
+  return BRANCH_TO_MODULE[branchName] || "Module inconnu";
 }
 
 /********************************************
- * 5) TES COEFS
+ * 6) NOTES MANUELLES
  ********************************************/
-let COEFS = JSON.parse(localStorage.getItem("COEFS_CACHE") || "{}");
+let MANUAL_GRADES = JSON.parse(localStorage.getItem("MANUAL_GRADES") || "{}");
 
-async function ensureCoefsLoaded() {
+function createSyntheticBlock(branchName, moyenne) {
+  const tr = document.createElement("tr");
+  const td = document.createElement("td");
+  td.colSpan = 6;
+  const coef = COEFS[branchName] ?? 1;
+  td.textContent = `${branchName} \u2013 moyenne\u00a0: ${moyenne.toFixed(2)} (coef ${coef}) [manuel]`;
+  td.dataset.coefAdded = "1";
 
-  if (Object.keys(COEFS).length > 0) return;
+  const delBtn = document.createElement("button");
+  delBtn.textContent = "\u2715";
+  delBtn.title = "Supprimer cette note manuelle";
+  delBtn.style.cssText = "margin-left:12px;cursor:pointer;font-size:11px;padding:1px 5px;border:1px solid #aaa;border-radius:3px;background:rgba(255,255,255,0.2);color:inherit;";
+  delBtn.onclick = () => {
+    delete MANUAL_GRADES[branchName];
+    localStorage.setItem("MANUAL_GRADES", JSON.stringify(MANUAL_GRADES));
+    renderAll();
+  };
+  td.appendChild(delBtn);
+  tr.appendChild(td);
+  return [tr];
+}
 
-  const html = await fetch("/consultation/programmes/detail.php").then(r => r.text());
-  const doc = new DOMParser().parseFromString(html, "text/html");
 
-  const rows = [...doc.getElementsByClassName("program_unit_row")];
 
-  for (const row of rows) {
+/********************************************
+ * 7) RENDU
+ ********************************************/
+let _cachedBlocks = null;
+let _cachedTbody = null;
 
-    const nameCell = row.children[0];
-    const coefCell = row.children[2];
+function renderAll() {
+  if (!_cachedBlocks || !_cachedTbody) return;
 
-    if (!nameCell || !coefCell) continue;
+  const displayedBranches = new Set(_cachedBlocks.map(b => b[0].textContent.trim().split(" ")[0]));
+  const blocks = [..._cachedBlocks];
 
-    const fullName = nameCell.textContent.trim();
-    const coefText = coefCell.textContent.trim();
-
-    const uvCodeMatch = fullName.match(/\((.*?)\)/);
-    if (!uvCodeMatch) continue;
-
-    const branch = uvCodeMatch[1];
-    const coef = parseInt(coefText, 10);
-
-    if (!isNaN(coef)) {
-      COEFS[branch] = coef;
+  for (const [branchName, moyenne] of Object.entries(MANUAL_GRADES)) {
+    if (!displayedBranches.has(branchName)) {
+      blocks.push(createSyntheticBlock(branchName, moyenne));
+      displayedBranches.add(branchName);
     }
-
   }
 
-  localStorage.setItem("COEFS_CACHE", JSON.stringify(COEFS));
+  blocks.sort((a, b) => {
+    const aBranch = a[0].textContent.trim().split(" ")[0];
+    const bBranch = b[0].textContent.trim().split(" ")[0];
+    const aModule = BRANCH_TO_MODULE[aBranch] || "";
+    const bModule = BRANCH_TO_MODULE[bBranch] || "";
+    return aModule.localeCompare(bModule);
+  });
+
+  const grouped = [];
+  let currentGroup = null;
+  for (const block of blocks) {
+    const module = getModule(block[0].textContent.trim().split(" ")[0]);
+    if (!currentGroup || currentGroup.module !== module) {
+      currentGroup = { module, blocks: [] };
+      grouped.push(currentGroup);
+    }
+    currentGroup.blocks.push(block);
+  }
+
+  const moduleStats = {};
+  for (const block of blocks) {
+    const headerText = block[0].textContent.trim();
+    const branchName = headerText.split(" ")[0];
+    const moyenne = extractMoyenne(headerText);
+    const module = BRANCH_TO_MODULE[branchName] || "Module inconnu";
+    const coef = COEFS[branchName] ?? 1;
+    if (moyenne === null || isNaN(moyenne)) continue;
+    if (!moduleStats[module]) moduleStats[module] = { sum: 0, coef: 0 };
+    moduleStats[module].sum += moyenne * coef;
+    moduleStats[module].coef += coef;
+  }
+
+  _cachedTbody.innerHTML = "";
+
+  for (const group of grouped) {
+    const stats = moduleStats[group.module];
+    const moduleMoyenne = stats && stats.coef > 0 ? stats.sum / stats.coef : 0;
+    _cachedTbody.appendChild(createModuleHeader(group.module, moduleMoyenne));
+
+    for (const block of group.blocks) {
+      const branchName = block[0].textContent.trim().split(" ")[0];
+      const headerCell = block[0].querySelector('td[colspan="6"]');
+      if (headerCell && !headerCell.dataset.coefAdded) {
+        headerCell.textContent += ` (coef ${COEFS[branchName] ?? 1})`;
+        headerCell.dataset.coefAdded = "1";
+      }
+      block.forEach(tr => _cachedTbody.appendChild(tr));
+    }
+
+    const spacer = document.createElement("tr");
+    const spacerTd = document.createElement("td");
+    spacerTd.colSpan = 6;
+    spacerTd.style.cssText = "height:14px;padding:0;background:none !important;border:none !important;box-shadow:none;";
+    spacer.appendChild(spacerTd);
+    _cachedTbody.appendChild(spacer);
+  }
 }
 
 /********************************************
- * 6) TON CODE EXISTANT
+ * 8) CODE EXISTANT
  ********************************************/
 function extractMoyenne(text) {
   const match = text.match(/moyenne(?:\s+hors\s+examen)?\s*:\s*([\d.,]+)/i);
@@ -191,7 +315,7 @@ function createModuleHeader(moduleName, moyenne) {
 }
 
 /********************************************
- * 7) OBSERVER
+ * 9) OBSERVER
  ********************************************/
 const observer = new MutationObserver(async () => {
 
@@ -200,8 +324,7 @@ const observer = new MutationObserver(async () => {
 
   observer.disconnect();
 
-  await ensureUVDataLoaded();
-  await ensureCoefsLoaded();
+  await ensureScanLoaded();
 
   const tbody = document.querySelectorAll("tbody")[4];
   const rows = Array.from(tbody.children);
@@ -220,74 +343,47 @@ const observer = new MutationObserver(async () => {
 
   if (currentBlock.length) blocks.push(currentBlock);
 
-  blocks.sort((a, b) => {
-
-    const aBranch = a[0].textContent.trim().split(" ")[0];
-    const bBranch = b[0].textContent.trim().split(" ")[0];
-
-    const aId = BRANCH_TO_ID[aBranch];
-    const bId = BRANCH_TO_ID[bBranch];
-
-    const aModule = UV_DATA[aId]?.module || "";
-    const bModule = UV_DATA[bId]?.module || "";
-
-    return aModule.localeCompare(bModule);
-
-  });
-
-  const moduleStats = {};
-
-  for (const block of blocks) {
-
-    const headerText = block[0].textContent.trim();
-    const branchName = headerText.split(" ")[0];
-    const moyenne = extractMoyenne(headerText);
-
-    const id = BRANCH_TO_ID[branchName];
-    const module = UV_DATA[id]?.module || "Module inconnu";
-    const coef = COEFS[branchName] ?? 1;
-
-    if (moyenne === null || isNaN(moyenne)) continue;
-
-    if (!moduleStats[module]) {
-      moduleStats[module] = { sum: 0, coef: 0 };
-    }
-
-    moduleStats[module].sum += moyenne * coef;
-    moduleStats[module].coef += coef;
-  }
-
-  tbody.innerHTML = "";
-
-  let lastModule = null;
-
-  for (const block of blocks) {
-
-    const branchName = block[0].textContent.trim().split(" ")[0];
-    const module = getModule(branchName);
-
-    if (module !== lastModule) {
-
-      const stats = moduleStats[module];
-      const moduleMoyenne = stats && stats.coef > 0 ? stats.sum / stats.coef : 0;
-
-      tbody.appendChild(createModuleHeader(module, moduleMoyenne));
-      lastModule = module;
-    }
-
-    block.forEach(tr => tbody.appendChild(tr));
-  }
+  _cachedBlocks = blocks;
+  _cachedTbody = tbody;
+  renderAll();
 
 });
 
 (async () => {
 
-  await ensureUVDataLoaded();
-  await ensureCoefsLoaded();
+  await ensureScanLoaded();
 
   observer.observe(document.body, {
     childList: true,
     subtree: true
   });
+
+  // Bouton reload : efface le cache et relance un scan complet
+  const reloadBtn = document.createElement("button");
+  reloadBtn.textContent = "⟳ Recharger le programme";
+  reloadBtn.title = "Efface le cache et rescanne le programme GAPS";
+  reloadBtn.style.cssText = [
+    "position:fixed", "bottom:14px", "right:14px",
+    "z-index:999999", "padding:6px 12px",
+    "background:#1e6fcc", "color:white",
+    "border:none", "border-radius:6px",
+    "font-size:13px", "cursor:pointer",
+    "box-shadow:0 2px 6px rgba(0,0,0,0.4)"
+  ].join(";");
+  reloadBtn.addEventListener("mouseenter", () => reloadBtn.style.background = "#155bb5");
+  reloadBtn.addEventListener("mouseleave", () => reloadBtn.style.background = "#1e6fcc");
+  reloadBtn.addEventListener("click", async () => {
+    localStorage.removeItem("UV_SCAN_CACHE");
+    SCAN_DATA = null;
+    BRANCH_TO_MODULE = {};
+    COEFS = {};
+    _cachedBlocks = null;
+    _cachedTbody = null;
+    reloadBtn.disabled = true;
+    reloadBtn.textContent = "Scan en cours…";
+    await ensureScanLoaded();
+    location.reload();
+  });
+  document.body.appendChild(reloadBtn);
 
 })();

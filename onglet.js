@@ -87,3 +87,5 @@ ul.appendChild(li);
 
 // remonte d'une position
 moveUp(li);
+
+

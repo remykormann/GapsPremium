@@ -27,11 +27,5 @@
       "browser_action_next_to_addressbar": true
     }
   },
-  "web_accessible_resources": [
-    {
-      "resources": ["uv_data.json"],
-      "matches": ["<all_urls>"]
-    }
-  ],
   "permissions": ["storage"]
 }
